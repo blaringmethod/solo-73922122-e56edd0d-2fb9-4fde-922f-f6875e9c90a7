@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -364,6 +364,75 @@ def store_completed_response(session: Session, key: str, response: dict) -> None
 # Transactional processing
 # --------------------------------------------------------------------------- #
 
+def _begin_write_transaction(session: Session, idempotency_key: str) -> None:
+    """Open the processing transaction with a write, never with a read.
+
+    Touching our own idempotency row (committed by ``acquire_idempotency_slot``
+    just before) as the transaction's first statement upgrades it to a write
+    transaction immediately. On SQLite this guarantees the transaction can
+    never hold a read snapshot that a concurrent commit invalidates halfway
+    through (SQLITE_BUSY_SNAPSHOT); concurrent writers simply serialize on the
+    database write lock with the busy timeout. On PostgreSQL it takes an early
+    row lock on the accession key. Pure-Python validation happens before this
+    point, so a bundle being validated holds no locks and does not block other
+    instances from committing.
+    """
+    session.execute(
+        update(IdempotencyRecord)
+        .where(IdempotencyRecord.key == idempotency_key)
+        .values(updated_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
+
+
+_UPDATE_MODELS = {"Observation": Observation, "DiagnosticReport": DiagnosticReport}
+
+
+def _claim_updates(session: Session, entries: list[ParsedEntry]) -> None:
+    """Atomically claim every PUT update with a compare-and-swap UPDATE.
+
+    ``UPDATE ... WHERE id = :id AND version = :if_match`` bumps the version in
+    a single statement: exactly one transaction can succeed for a given
+    (resource, base version) pair, on any isolation level and on any dialect.
+    A concurrent correction that committed in between turns the match empty,
+    so the loser gets 412 (or 404 when the resource does not exist) and the
+    whole bundle rolls back — the report body, its observation links and its
+    version history are left untouched. Claims run in a deterministic order
+    so concurrent bundles cannot deadlock over row locks on PostgreSQL.
+    """
+    claims = sorted(
+        (e for e in entries if e.method == "PUT"),
+        key=lambda e: (e.resource_type, e.update_id or ""),
+    )
+    for entry in claims:
+        model = _UPDATE_MODELS[entry.resource_type]
+        new_version = (entry.if_match or 0) + 1
+        result = session.execute(
+            update(model)
+            .where(model.id == entry.update_id, model.version == entry.if_match)
+            .values(
+                version=new_version,
+                status="updated",
+                updated_at=datetime.now(timezone.utc),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 0:
+            existing = session.get(model, entry.update_id)
+            if existing is None:
+                raise not_found(
+                    f"Bundle.entry[{entry.index}]: {entry.resource_type}/"
+                    f"{entry.update_id} does not exist."
+                )
+            raise precondition_failed(
+                f"Bundle.entry[{entry.index}]: If-Match version {entry.if_match} is stale; "
+                f"current version is {existing.version}."
+            )
+        entry.row_id = entry.update_id
+        entry.version = new_version
+        entry.action = "updated"
+
+
 def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict:
     entries = validate_bundle(bundle)
     hash_value = content_hash(bundle)
@@ -373,6 +442,9 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
         return _canonicalize(replay)
 
     try:
+        _begin_write_transaction(session, idempotency_key)
+        _claim_updates(session, entries)
+
         patient_entries = [e for e in entries if e.resource_type == "Patient"]
         observation_entries = [e for e in entries if e.resource_type == "Observation"]
         report_entries = [e for e in entries if e.resource_type == "DiagnosticReport"]
@@ -561,19 +633,13 @@ def _resolve_observations(
 
     for entry in observation_entries:
         if entry.method == "PUT":
+            # The CAS claim already verified If-Match and bumped the version;
+            # just load the (now locked/claimed) row.
             obs = _locked(session, Observation, entry.update_id)
-            if obs is None:
+            if obs is None:  # pragma: no cover - claim guarantees existence
                 raise not_found(
                     f"Bundle.entry[{entry.index}]: Observation/{entry.update_id} does not exist."
                 )
-            if entry.if_match != obs.version:
-                raise precondition_failed(
-                    f"Bundle.entry[{entry.index}]: If-Match version {entry.if_match} is stale; "
-                    f"current version is {obs.version}."
-                )
-            entry.row_id = obs.id
-            entry.version = obs.version
-            entry.action = "updated"
         else:
             obs = Observation(
                 patient_id=entry.subject_pid,
@@ -623,19 +689,12 @@ def _resolve_reports(
     rows: dict[str, DiagnosticReport] = {}
     for entry in report_entries:
         if entry.method == "PUT":
+            # The CAS claim already verified If-Match and bumped the version.
             report = _locked(session, DiagnosticReport, entry.update_id)
-            if report is None:
+            if report is None:  # pragma: no cover - claim guarantees existence
                 raise not_found(
                     f"Bundle.entry[{entry.index}]: DiagnosticReport/{entry.update_id} does not exist."
                 )
-            if entry.if_match != report.version:
-                raise precondition_failed(
-                    f"Bundle.entry[{entry.index}]: If-Match version {entry.if_match} is stale; "
-                    f"current version is {report.version}."
-                )
-            entry.row_id = report.id
-            entry.version = report.version
-            entry.action = "updated"
         else:
             report = DiagnosticReport(
                 patient_id=entry.subject_pid,
@@ -752,7 +811,7 @@ def _apply_observations(
 ) -> None:
     for entry in observation_entries:
         obs = obs_rows[entry.row_id]
-        resource = _render_resource(entry, entry.version if entry.method == "POST" else entry.if_match + 1)
+        resource = _render_resource(entry, entry.version)
         resource["subject"] = {"reference": f"Patient/{entry.subject_pid}"}
 
         if entry.method == "POST":
@@ -768,23 +827,19 @@ def _apply_observations(
                 )
             )
         else:
-            new_version = obs.version + 1
-            resource["id"] = obs.id
-            resource["meta"]["versionId"] = str(new_version)
+            # The version was already bumped atomically by the CAS claim.
             obs.resource = resource
             obs.patient_id = entry.subject_pid  # type: ignore[assignment]
-            obs.version = new_version
             obs.status = "updated"
             session.add(
                 ResourceVersion(
                     resource_type="Observation",
                     resource_id=obs.id,
-                    version=new_version,
+                    version=entry.version,
                     status="updated",
                     resource=resource,
                 )
             )
-            entry.version = new_version
 
 
 def _apply_reports(
@@ -796,7 +851,8 @@ def _apply_reports(
 ) -> None:
     for entry in report_entries:
         report = report_rows[entry.row_id]
-        target_version = 1 if entry.method == "POST" else report.version + 1
+        # For PUT the version was already bumped atomically by the CAS claim.
+        target_version = entry.version
         resource = _render_resource(entry, target_version)
         resource["subject"] = {"reference": f"Patient/{entry.subject_pid}"}
         resource["result"] = [
@@ -805,7 +861,6 @@ def _apply_reports(
 
         if entry.method == "PUT":
             report.patient_id = entry.subject_pid  # type: ignore[assignment]
-            report.version = target_version
             report.status = "updated"
             # Replace the link set with the submitted result list.
             for link in list(report.links):

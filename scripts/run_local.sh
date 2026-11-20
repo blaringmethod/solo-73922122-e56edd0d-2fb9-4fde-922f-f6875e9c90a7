@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Convenience launcher for local (non-Docker) development.
-# Requires a reachable PostgreSQL in DATABASE_URL (default points at compose db).
+# Defaults to a file-based SQLite database (same shape as docker-compose);
+# point DATABASE_URL at PostgreSQL for the production dialect.
 set -euo pipefail
 
-export DATABASE_URL="${DATABASE_URL:-postgresql+psycopg2://research:research@localhost:5432/researchdb}"
+export DATABASE_URL="${DATABASE_URL:-sqlite:////tmp/research.db}"
 export PYTHONPATH="$(cd "$(dirname "$0")" && pwd):${PYTHONPATH:-}"
 
 python -m app.db_init

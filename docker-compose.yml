@@ -1,6 +1,47 @@
+# Two API instances sharing one SQLite database file (the deployment shape
+# this repository's concurrency guarantees are verified against).
+#
+#   docker compose up --build
+#
+#   api1: http://localhost:8001/docs
+#   api2: http://localhost:8002/docs
+#
+# Both containers mount the same volume and use the same database file, so a
+# correction submitted to one instance is immediately visible (and
+# version-protected) on the other.
+#
+# The production PostgreSQL profile is still available:
+#   docker compose --profile postgres up --build db api-pg
+
+x-api-common: &api-common
+  build: .
+  volumes:
+    - sqlite-data:/data
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
 services:
+  api1:
+    <<: *api-common
+    environment:
+      DATABASE_URL: sqlite:////data/research.db
+    ports:
+      - "8001:8000"
+
+  api2:
+    <<: *api-common
+    environment:
+      DATABASE_URL: sqlite:////data/research.db
+    ports:
+      - "8002:8000"
+
+  # --- Optional PostgreSQL profile (production target) -------------------- #
   db:
     image: postgres:16-alpine
+    profiles: ["postgres"]
     environment:
       POSTGRES_USER: research
       POSTGRES_PASSWORD: research
@@ -15,8 +56,9 @@ services:
       timeout: 3s
       retries: 20
 
-  api:
+  api-pg:
     build: .
+    profiles: ["postgres"]
     depends_on:
       db:
         condition: service_healthy
@@ -26,4 +68,5 @@ services:
       - "8000:8000"
 
 volumes:
+  sqlite-data:
   pgdata:

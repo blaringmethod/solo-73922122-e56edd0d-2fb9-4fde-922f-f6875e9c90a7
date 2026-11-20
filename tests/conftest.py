@@ -24,6 +24,15 @@ from app.database import Base  # noqa: E402
 from app.main import app  # noqa: E402
 
 
+def skip_unless_shared_database():
+    """Concurrency tests need connections that see each other's commits:
+    PostgreSQL or a file-based SQLite database (as in the two-instance
+    docker-compose deployment), not a per-connection in-memory SQLite."""
+    url = str(database.engine.url)
+    if database.engine.dialect.name == "sqlite" and ":memory:" in url:
+        pytest.skip("concurrency test requires PostgreSQL or file-based SQLite")
+
+
 @pytest.fixture(scope="session")
 def engine():
     eng = create_engine(

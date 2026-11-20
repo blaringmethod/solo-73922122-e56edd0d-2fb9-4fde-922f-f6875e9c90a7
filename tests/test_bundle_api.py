@@ -1,9 +1,7 @@
-"""End-to-end functional tests of the ingest API on PostgreSQL."""
+"""End-to-end functional tests of the ingest API."""
 from __future__ import annotations
 
 import concurrent.futures
-
-import pytest
 
 from tests.conftest import (
     make_bundle,
@@ -332,11 +330,9 @@ def test_move_observation_with_corrected_report_in_same_bundle(client):
 
 
 def test_concurrent_identical_patient_creates_one_row(client):
-    # Skip where row locking semantics do not apply.
-    from app import database
+    from tests.conftest import skip_unless_shared_database
 
-    if database.engine.dialect.name == "sqlite":
-        pytest.skip("concurrency test requires PostgreSQL")
+    skip_unless_shared_database()
 
     system, value = "http://hospital/mrn", "RACE-1"
 
@@ -355,10 +351,9 @@ def test_concurrent_identical_patient_creates_one_row(client):
 
 
 def test_concurrent_updates_serialize_via_if_match(client):
-    from app import database
+    from tests.conftest import skip_unless_shared_database
 
-    if database.engine.dialect.name == "sqlite":
-        pytest.skip("concurrency test requires PostgreSQL")
+    skip_unless_shared_database()
 
     p_urn, o_urn = urn(), urn()
     p, _ = patient_entry(p_urn, value="RACE-UPD")
